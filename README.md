@@ -9,11 +9,12 @@ It is meant to be a practical compatibility layer: point clients at `localhost:4
 ```text
 http://localhost:4242/v1                  # default profile
 http://localhost:4242/myproject/v1        # example profile
+http://localhost:4242/codex/v1            # Codex-compatible Responses API profile
 http://localhost:4242/hermes/v1           # local profile you can add
 http://localhost:4242/opencode/v1         # local profile you can add
 ```
 
-Only `default` and `myproject` are shipped as public example profiles. Real local profiles are meant to live in your own `~/.config/resilient-llm-bridge/config.yaml`, outside the repo.
+`default`, `myproject`, and `codex` are shipped as public example profiles. Real local profiles are meant to live in your own `~/.config/resilient-llm-bridge/config.yaml`, outside the repo.
 
 ## Features
 
@@ -34,6 +35,7 @@ Examples:
 
 - `default`: conservative catch-all for unknown clients.
 - `myproject`: a project-specific profile with higher queue priority than background work.
+- `codex`: an interactive Codex profile with strict Responses-API SSE compatibility enabled.
 - `hermes`: a local profile you might configure for fast interactive chat.
 - `opencode`: a local profile that respects the selected model but translates `reasoning_effort` into the upstream thinking fields.
 - `batch-heavy`: a local profile for offline jobs that need more thinking budget and lower priority.
@@ -173,6 +175,24 @@ profiles:
       - gemma_thought_leak_retry
     disabled_features: []
 
+  codex:
+    upstream: nan
+    queue_priority: 10
+    auto_retries: true
+    force_stream: true
+    model_fallback_enabled: true
+    codex-compat-enabled: true
+    features:
+      - model_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+      - tool_call_args_retry
+      - xml_tool_residue_retry
+
 default_profile: default
 ```
 
@@ -191,6 +211,7 @@ Common profile fields:
 | `auto_retries` | Retry transient upstream failures before bytes reach the client |
 | `force_stream` | Send `stream=true` upstream even when the client did not |
 | `model_fallback_enabled` | Fallback to another active model when the selected model is unhealthy or fails before bytes reach the client |
+| `codex-compat-enabled` | Codex-only Responses adapter; rewrites the request shape for NaN/LiteLLM and synthesizes strict SSE close events. Default is false |
 | `force_model` | Optional hard model override, e.g. `qwen3.6` or `gemma4` |
 | `thinking_enabled` | `true`, `false`, or omitted to respect client/upstream defaults |
 | `default_thinking_effort` | Optional `low`, `medium`, `high`, or `xhigh` when profile enables thinking by default |
@@ -257,6 +278,67 @@ http://127.0.0.1:4242/myproject/v1
 ```
 
 Do not commit real API keys. Use environment variables such as `X_NAN_KEY` in your client config.
+
+## Using NaN With Codex
+
+Codex should use the bridge's dedicated `codex` profile, not the catch-all
+`default` profile:
+
+```text
+http://127.0.0.1:4242/codex/v1
+```
+
+That profile enables `codex-compat-enabled`. This is intentionally not a
+transparent Responses proxy: it adapts Codex's Responses payload to the shape
+NaN/LiteLLM accepts, then synthesizes the strict SSE closing events Codex waits
+for when the upstream omits them. In practice it folds `developer`/`system`
+input items into `instructions` and drops unsupported `namespace` tool wrappers
+from the upstream request. Keep it disabled for non-Codex clients that need raw
+OpenAI Responses semantics.
+
+The profile also uses `model_fallback_enabled: true` so the bridge can move to
+an active configured model if the selected one fails before any client-visible
+bytes are sent.
+
+Minimal `~/.codex/config.toml` entries:
+
+```toml
+model = "qwen3.6"
+model_provider = "nan"
+model_context_window = 262144
+model_max_output_tokens = 32000
+model_reasoning_summary = "auto"
+model_reasoning_effort = "high"
+web_search = "disabled"
+
+[model_providers.nan]
+name = "resilient-llm-bridge codex profile -> NaN Builders"
+base_url = "http://127.0.0.1:4242/codex/v1"
+env_key = "X_NAN_KEY"
+wire_api = "responses"
+
+[profiles.nan]
+model = "qwen3.6"
+model_provider = "nan"
+model_context_window = 262144
+model_max_output_tokens = 32000
+model_reasoning_summary = "auto"
+model_reasoning_effort = "high"
+web_search = "disabled"
+```
+
+Then add a shell wrapper:
+
+```bash
+codex-nan() { CODEX_HOME="$HOME/.codex" codex --profile nan "$@"; }
+```
+
+Run it with:
+
+```bash
+codex-nan
+codex-nan "inspect this repo"
+```
 
 ## Dashboard
 

@@ -211,6 +211,19 @@ def _write_test_config(path: Path, mock_url: str) -> None:
                     "xml_tool_residue_retry",
                 ],
             },
+            "codex": {
+                "upstream": "mock",
+                "queue_priority": 10,
+                "force_stream": True,
+                "model_fallback_enabled": True,
+                "codex-compat-enabled": True,
+                "features": [
+                    "thinking_overflow_recovery",
+                    "silent_completion_recovery",
+                    "truncated_content_recovery",
+                    "empty_with_stop_retry",
+                ],
+            },
         },
         "default_profile": "test",
     }
@@ -453,6 +466,1196 @@ def case_fake_invocation(t: TestState) -> None:
     r.raise_for_status()
 
     t.assert_recovery(label, label)
+
+
+def _responses_stream_missing_message_done_events() -> dict:
+    return {
+        "stream_events": [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_codex_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                },
+                "sequence_number": 1,
+                "model": "test-model",
+            },
+            {
+                "type": "response.content_part.added",
+                "item_id": "msg_codex_1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+                "sequence_number": 2,
+                "model": "test-model",
+            },
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_codex_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Hello from Codex compat.",
+                "sequence_number": 3,
+                "model": "test-model",
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_codex_1",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "test-model",
+                    "output": [
+                        {
+                            "id": "msg_codex_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Hello from Codex compat.",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10},
+                },
+                "sequence_number": 4,
+                "model": "test-model",
+            },
+        ],
+    }
+
+
+def _sse_events(text: str) -> list[dict]:
+    events: list[dict] = []
+    for block in text.split("\n\n"):
+        for line in block.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if not data or data == "[DONE]":
+                continue
+            events.append(json.loads(data))
+            break
+    return events
+
+
+def case_codex_compat_synthesizes_responses_done_events(t: TestState) -> None:
+    """Codex compatibility is opt-in and synthesizes missing message close events."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+
+    t.queue("/v1/responses", _responses_stream_missing_message_done_events())
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        plain_text = "".join(r.iter_text())
+    if "response.output_item.done" in plain_text:
+        raise AssertionError("non-Codex profile synthesized output_item.done")
+
+    t.queue("/v1/responses", _responses_stream_missing_message_done_events())
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+    for expected in ("response.output_item.done", "response.completed"):
+        if expected not in codex_text:
+            raise AssertionError(f"missing {expected} in Codex compat stream: {codex_text}")
+    if codex_text.index("response.output_item.done") > codex_text.index("response.completed"):
+        raise AssertionError("Codex close events must be emitted before response.completed")
+    if "[DONE]" in codex_text and codex_text.index("[DONE]") < codex_text.index("response.completed"):
+        raise AssertionError("Codex stream must not emit [DONE] before response.completed")
+
+    print("  ✓ codex compatibility: missing Responses done events synthesized only when enabled")
+
+
+def case_codex_compat_suppresses_text_done_to_avoid_duplicate_messages(t: TestState) -> None:
+    """Codex should see one visible close event for assistant messages."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "msg_text_done",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                    "sequence_number": 1,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_text_done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "sequence_number": 2,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_text_done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Hello once.",
+                    "sequence_number": 3,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.done",
+                    "item_id": "msg_text_done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "Hello once.",
+                    "sequence_number": 4,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_text_done",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "msg_text_done",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Hello once.",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "sequence_number": 5,
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    if "response.output_text.done" in codex_text:
+        raise AssertionError(f"output_text.done should be suppressed for Codex: {codex_text}")
+    if codex_text.count("response.output_item.done") != 1:
+        raise AssertionError(f"message should be closed exactly once: {codex_text}")
+    if "response.completed" not in codex_text:
+        raise AssertionError(f"missing completed event: {codex_text}")
+
+    print("  ✓ codex compatibility: output_text.done suppressed to avoid duplicate messages")
+
+
+def case_codex_compat_deduplicates_orphan_deltas_before_real_message(t: TestState) -> None:
+    """NaN can send unframed deltas before the real message lifecycle."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "resp_orphan",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "HOL",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "resp_orphan",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "A",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                    "sequence_number": 1,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_real",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "sequence_number": 2,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_real",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "HOLA",
+                    "sequence_number": 3,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "HOLA",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                    "sequence_number": 4,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_orphan_then_real",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "msg_real",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "HOLA",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "sequence_number": 5,
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    events = _sse_events(codex_text)
+    deltas = [
+        event
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    ]
+    done_messages = [
+        event
+        for event in events
+        if event.get("type") == "response.output_item.done"
+        and (event.get("item") or {}).get("type") == "message"
+    ]
+    if [event.get("delta") for event in deltas] != ["HOLA"]:
+        raise AssertionError(f"orphan deltas were not suppressed: {codex_text}")
+    if len(done_messages) != 1:
+        raise AssertionError(f"message should be closed exactly once: {codex_text}")
+    completed = next(
+        event for event in events if event.get("type") == "response.completed"
+    )
+    completed_output = (completed.get("response") or {}).get("output") or []
+    if any(
+        isinstance(item, dict) and item.get("type") == "message"
+        for item in completed_output
+    ):
+        raise AssertionError(f"completed output still duplicated message: {codex_text}")
+
+    print("  ✓ codex compatibility: orphan text deltas deduplicated before real message")
+
+
+def case_codex_compat_deduplicates_unsequenced_provisional_message(t: TestState) -> None:
+    """NaN can open a provisional resp_* message before the real msg_* item."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "resp_provisional",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "resp_provisional",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "resp_provisional",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "HOLA",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real_after_provisional",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                    "sequence_number": 1,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_real_after_provisional",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "sequence_number": 2,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_real_after_provisional",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "HOLA",
+                    "sequence_number": 3,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real_after_provisional",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "HOLA",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                    "sequence_number": 4,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "resp_provisional",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "HOLA",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_unsequenced_provisional",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "msg_real_after_provisional",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "HOLA",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "sequence_number": 5,
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    events = _sse_events(codex_text)
+    done_messages = [
+        event
+        for event in events
+        if event.get("type") == "response.output_item.done"
+        and (event.get("item") or {}).get("type") == "message"
+    ]
+    if len(done_messages) != 1:
+        raise AssertionError(f"provisional message should not close: {codex_text}")
+    if (done_messages[0].get("item") or {}).get("id") != "msg_real_after_provisional":
+        raise AssertionError(f"wrong message surfaced: {codex_text}")
+
+    print("  ✓ codex compatibility: unsequenced provisional messages ignored")
+
+
+def case_codex_compat_deduplicates_late_orphan_deltas_after_real_message(t: TestState) -> None:
+    """NaN can also send duplicate unframed deltas after a real message closes."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real_late",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                    "sequence_number": 1,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_real_late",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "sequence_number": 2,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_real_late",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "HOLA",
+                    "sequence_number": 3,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "id": "msg_real_late",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "HOLA",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                    "sequence_number": 4,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "resp_late_orphan",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "HOLA",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_real_then_late_orphan",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "msg_real_late",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "HOLA",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "sequence_number": 5,
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    events = _sse_events(codex_text)
+    deltas = [
+        event
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    ]
+    done_messages = [
+        event
+        for event in events
+        if event.get("type") == "response.output_item.done"
+        and (event.get("item") or {}).get("type") == "message"
+    ]
+    if [event.get("delta") for event in deltas] != ["HOLA"]:
+        raise AssertionError(f"late orphan delta was not suppressed: {codex_text}")
+    if len(done_messages) != 1:
+        raise AssertionError(f"message should be closed exactly once: {codex_text}")
+
+    print("  ✓ codex compatibility: late orphan text deltas ignored after real message")
+
+
+def case_codex_compat_normalizes_nan_responses_request(t: TestState) -> None:
+    """Codex sends Responses shapes that NaN/LiteLLM rejects unless normalized."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "instructions": "base instructions",
+        "stream": True,
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "developer instructions"}],
+            },
+            {"type": "message", "role": "user", "content": "hello"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "previous assistant answer",
+                    }
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "namespace",
+                "name": "mcp__context7__",
+                "description": "MCP namespace wrapper unsupported by NaN",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "query_docs",
+                        "description": "query docs",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    t.queue("/v1/responses", _responses_stream_missing_message_done_events())
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+    if "response.completed" not in codex_text:
+        raise AssertionError(f"Codex normalized request did not complete: {codex_text}")
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    sent = (seen.get("/v1/responses") or [])[-1]
+    instructions = sent.get("instructions") or ""
+    if "base instructions" not in instructions or "developer instructions" not in instructions:
+        raise AssertionError(f"developer/system input was not folded into instructions: {sent}")
+    roles = [
+        item.get("role")
+        for item in (sent.get("input") or [])
+        if isinstance(item, dict) and item.get("type", "message") == "message"
+    ]
+    if any(role in {"developer", "system"} for role in roles):
+        raise AssertionError(f"developer/system roles leaked to upstream input: {roles}")
+    assistant_items = [
+        item
+        for item in (sent.get("input") or [])
+        if isinstance(item, dict) and item.get("role") == "assistant"
+    ]
+    if not assistant_items:
+        raise AssertionError(f"assistant history item was dropped: {sent}")
+    assistant_content = assistant_items[-1].get("content") or []
+    assistant_part_types = [
+        part.get("type")
+        for part in assistant_content
+        if isinstance(part, dict)
+    ]
+    if "output_text" in assistant_part_types or "input_text" not in assistant_part_types:
+        raise AssertionError(
+            f"assistant output_text history was not normalized to input_text: {assistant_items[-1]}"
+        )
+    tool_types = [
+        tool.get("type")
+        for tool in (sent.get("tools") or [])
+        if isinstance(tool, dict)
+    ]
+    if "namespace" in tool_types or "function" not in tool_types:
+        raise AssertionError(f"unexpected normalized tool types: {tool_types}")
+
+    print("  ✓ codex compatibility: Responses body normalized for NaN/LiteLLM")
+
+
+def case_codex_compat_synthesizes_missing_completed(t: TestState) -> None:
+    """Codex should never see EOF/[DONE] before response.completed."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+
+    t.queue("/v1/responses", {"stream_events": []})
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    if "response.completed" not in codex_text:
+        raise AssertionError(f"Codex stream did not synthesize response.completed: {codex_text}")
+    if "[DONE]" in codex_text and codex_text.index("[DONE]") < codex_text.index("response.completed"):
+        raise AssertionError(f"Codex stream emitted [DONE] before response.completed: {codex_text}")
+
+    print("  ✓ codex compatibility: missing response.completed synthesized before [DONE]")
+
+
+def case_codex_compat_synthesizes_message_lifecycle_from_deltas(t: TestState) -> None:
+    """NaN can stream only text deltas plus completed; Codex needs item lifecycle events."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_delta_only",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Hello delta-only.",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_delta_only",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "msg_delta_only",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Hello delta-only.",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    expected_order = [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    positions = []
+    for expected in expected_order:
+        if expected not in codex_text:
+            raise AssertionError(f"missing {expected} in delta-only Codex stream: {codex_text}")
+        positions.append(codex_text.index(expected))
+    if positions != sorted(positions):
+        raise AssertionError(f"Codex lifecycle events out of order: {codex_text}")
+    if "[DONE]" in codex_text and codex_text.index("[DONE]") < codex_text.index("response.completed"):
+        raise AssertionError(f"Codex stream emitted [DONE] before response.completed: {codex_text}")
+
+    print("  ✓ codex compatibility: full message lifecycle synthesized from text deltas")
+
+
+def case_codex_compat_patches_reasoning_summary_and_smooths_text(t: TestState) -> None:
+    """Codex should get a visible reasoning summary and small text deltas."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "reasoning": {"effort": "high"},
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    long_delta = "Streaming text chunk. " * 12
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_smooth",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": long_delta,
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_reasoning_summary",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "rs_1",
+                                "type": "reasoning",
+                                "summary": [],
+                                "content": [
+                                    {
+                                        "type": "reasoning_text",
+                                        "text": "Raw private reasoning from upstream.",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "msg_smooth",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": long_delta,
+                                        "annotations": [],
+                                    }
+                                ],
+                            },
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 30, "total_tokens": 34},
+                    },
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    if "Thinking before answering." not in codex_text:
+        raise AssertionError(f"Codex reasoning summary was not patched: {codex_text}")
+    for expected in (
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.done",
+    ):
+        if expected not in codex_text:
+            raise AssertionError(f"missing Codex reasoning lifecycle event {expected}: {codex_text}")
+    if "Raw private reasoning from upstream." in codex_text:
+        raise AssertionError(f"raw reasoning content leaked to Codex stream: {codex_text}")
+    if codex_text.count("response.output_text.delta") < 2:
+        raise AssertionError(f"Codex text delta was not smoothed: {codex_text}")
+    events = _sse_events(codex_text)
+    completed = next(
+        (ev for ev in events if ev.get("type") == "response.completed"),
+        None,
+    )
+    if completed is None:
+        raise AssertionError(f"missing completed event: {codex_text}")
+    completed_output = ((completed.get("response") or {}).get("output") or [])
+    for item in completed_output:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            raise AssertionError(f"streamed reasoning item should be stripped from completed output: {completed}")
+
+    print("  ✓ codex compatibility: reasoning summary patched and text deltas smoothed")
+
+
+def case_codex_compat_synthesizes_function_call_lifecycle(t: TestState) -> None:
+    """Codex needs streamed function-call events, not only completed.output."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "list home"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    tool_completed = {
+        "stream_events": [
+            {
+                "type": "response.reasoning_text.delta",
+                "delta": "I should inspect the filesystem with a tool.",
+                "sequence_number": 1,
+                "model": "test-model",
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_tool_only",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "test-model",
+                    "output": [
+                        {
+                            "id": "rs_tool",
+                            "type": "reasoning",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "Need a tool call.",
+                                }
+                            ],
+                        },
+                        {
+                            "id": "fc_tool",
+                            "type": "function_call",
+                            "call_id": "call_tool",
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"ls /home\"}",
+                            "status": "completed",
+                        },
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 8, "total_tokens": 12},
+                },
+                "sequence_number": 2,
+                "model": "test-model",
+            },
+        ],
+    }
+
+    t.queue("/v1/responses", tool_completed)
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        plain_text = "".join(r.iter_text())
+    if "response.function_call_arguments.done" in plain_text:
+        raise AssertionError("non-Codex profile synthesized function-call lifecycle")
+
+    t.queue("/v1/responses", tool_completed)
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    events = _sse_events(codex_text)
+
+    def event_position(predicate) -> int:
+        for pos, event in enumerate(events):
+            if predicate(event):
+                return pos
+        return -1
+
+    positions = [
+        event_position(
+            lambda ev: ev.get("type") == "response.output_item.added"
+            and (ev.get("item") or {}).get("type") == "function_call"
+        ),
+        event_position(lambda ev: ev.get("type") == "response.function_call_arguments.delta"),
+        event_position(lambda ev: ev.get("type") == "response.function_call_arguments.done"),
+        event_position(
+            lambda ev: ev.get("type") == "response.output_item.done"
+            and (ev.get("item") or {}).get("type") == "function_call"
+        ),
+        event_position(lambda ev: ev.get("type") == "response.completed"),
+    ]
+    if any(pos < 0 for pos in positions):
+        raise AssertionError(f"missing Codex function-call lifecycle event: {codex_text}")
+    if positions != sorted(positions):
+        raise AssertionError(f"Codex function-call lifecycle events out of order: {codex_text}")
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    if seen.get("/v1/chat/completions"):
+        raise AssertionError("function-call-only Responses completion was treated as silent")
+    latest = t.latest_activity()
+    if latest is None or latest.get("recovery") is not None:
+        raise AssertionError(f"function call should not trigger recovery, got {latest}")
+
+    print("  ✓ codex compatibility: function-call lifecycle synthesized without silent recovery")
+
+
+def case_codex_compat_synthesizes_completed_only_message_lifecycle(t: TestState) -> None:
+    """A completed-only message should still become visible to Codex."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    completed_only = {
+        "stream_events": [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_completed_only_message",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "test-model",
+                    "output": [
+                        {
+                            "id": "msg_completed_only",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Completed-only answer.",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                },
+                "sequence_number": 1,
+                "model": "test-model",
+            },
+        ],
+    }
+
+    t.queue("/v1/responses", completed_only)
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        plain_text = "".join(r.iter_text())
+    if "response.output_text.delta" in plain_text:
+        raise AssertionError("non-Codex profile synthesized completed-only message lifecycle")
+
+    t.queue("/v1/responses", completed_only)
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    expected_order = [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    positions = []
+    for expected in expected_order:
+        if expected not in codex_text:
+            raise AssertionError(f"missing {expected} in completed-only Codex stream: {codex_text}")
+        positions.append(codex_text.index(expected))
+    if positions != sorted(positions):
+        raise AssertionError(f"Codex completed-only message events out of order: {codex_text}")
+    if "Completed-only answer." not in codex_text:
+        raise AssertionError(f"completed-only text was not surfaced: {codex_text}")
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    if seen.get("/v1/chat/completions"):
+        raise AssertionError("completed-only message was treated as silent")
+    latest = t.latest_activity()
+    if latest is None or latest.get("recovery") is not None:
+        raise AssertionError(f"completed-only message should not trigger recovery, got {latest}")
+
+    print("  ✓ codex compatibility: completed-only messages get a visible lifecycle")
+
+
+def case_codex_compat_does_not_double_close_message_with_missing_delta_index(t: TestState) -> None:
+    """Deltas without output_index must be reconciled with completed by item_id."""
+    t.reset_mock()
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    t.queue(
+        "/v1/responses",
+        {
+            "stream_events": [
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_no_delta_index",
+                    "content_index": 0,
+                    "delta": "Hello once.",
+                    "model": "test-model",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_no_delta_index",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "test-model",
+                        "output": [
+                            {
+                                "id": "rs_no_delta_index",
+                                "type": "reasoning",
+                                "summary": [
+                                    {"type": "summary_text", "text": "Answered directly."}
+                                ],
+                            },
+                            {
+                                "id": "msg_no_delta_index",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Hello once.",
+                                        "annotations": [],
+                                    }
+                                ],
+                            },
+                        ],
+                        "usage": {"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                    },
+                    "model": "test-model",
+                },
+            ],
+        },
+    )
+
+    with httpx.stream("POST", f"{t.bridge}/codex/v1/responses", json=body, timeout=15) as r:
+        r.raise_for_status()
+        codex_text = "".join(r.iter_text())
+
+    events = _sse_events(codex_text)
+    message_done_events = [
+        ev
+        for ev in events
+        if ev.get("type") == "response.output_item.done"
+        and (ev.get("item") or {}).get("type") == "message"
+    ]
+    if len(message_done_events) != 1:
+        raise AssertionError(f"message was closed more than once: {codex_text}")
+    reasoning_done_indexes = {
+        ev.get("output_index")
+        for ev in events
+        if ev.get("type") == "response.output_item.done"
+        and (ev.get("item") or {}).get("type") == "reasoning"
+    }
+    if message_done_events[0].get("output_index") in reasoning_done_indexes:
+        raise AssertionError(f"message reused reasoning output_index: {codex_text}")
+    if "response.completed" not in codex_text:
+        raise AssertionError(f"missing completed event: {codex_text}")
+    if codex_text.index("response.output_item.done") > codex_text.index("response.completed"):
+        raise AssertionError(f"message close happened after completed: {codex_text}")
+
+    print("  ✓ codex compatibility: missing delta output_index does not duplicate messages")
 
 
 def case_truncated_content(t: TestState) -> None:
@@ -1368,6 +2571,18 @@ def main() -> int:
             case_thinking_overflow(t)
             case_silent_completion(t)
             case_fake_invocation(t)
+            case_codex_compat_synthesizes_responses_done_events(t)
+            case_codex_compat_suppresses_text_done_to_avoid_duplicate_messages(t)
+            case_codex_compat_deduplicates_orphan_deltas_before_real_message(t)
+            case_codex_compat_deduplicates_unsequenced_provisional_message(t)
+            case_codex_compat_deduplicates_late_orphan_deltas_after_real_message(t)
+            case_codex_compat_normalizes_nan_responses_request(t)
+            case_codex_compat_synthesizes_missing_completed(t)
+            case_codex_compat_synthesizes_message_lifecycle_from_deltas(t)
+            case_codex_compat_patches_reasoning_summary_and_smooths_text(t)
+            case_codex_compat_synthesizes_function_call_lifecycle(t)
+            case_codex_compat_synthesizes_completed_only_message_lifecycle(t)
+            case_codex_compat_does_not_double_close_message_with_missing_delta_index(t)
             case_truncated_content(t)
             case_empty_with_stop_retry(t)
             case_xml_tool_residue_retry_nonstream(t)

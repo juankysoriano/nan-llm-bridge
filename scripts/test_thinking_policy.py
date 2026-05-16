@@ -151,6 +151,23 @@ def case_health_rate_limit_preserves_previous_status() -> None:
         bridge._MODEL_HEALTH.update(previous_health)
 
 
+def case_health_errors_redact_provider_keys() -> None:
+    label = "health errors redact provider keys"
+    status = bridge._preserve_model_health_status(
+        "nan",
+        "gemma4",
+        "health probe rate-limited: api_key: abcdef0123456789abcdef0123456789",
+        status=429,
+        latency_s=0.1,
+    )
+    error = status.get("error") or ""
+    if "abcdef0123456789abcdef0123456789" in error:
+        fail(label, f"provider key leaked in health error: {status}")
+    if "<redacted>" not in error:
+        fail(label, f"expected redacted marker in health error: {status}")
+    ok(label, "provider error text is sanitized before health exposure")
+
+
 def case_default_profile_no_signals() -> None:
     """`default`-style profile (thinking_enabled=true, budget=4096), client
     sends nothing → bridge injects both."""
@@ -475,6 +492,7 @@ def main() -> int:
         case_default_on_feature_can_be_disabled,
         case_runtime_429_fallback_does_not_mark_model_inactive,
         case_health_rate_limit_preserves_previous_status,
+        case_health_errors_redact_provider_keys,
         case_default_profile_no_signals,
         case_named_profile_client_effort_high,
         case_named_profile_client_responses_effort,

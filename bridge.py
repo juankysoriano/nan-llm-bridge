@@ -246,6 +246,10 @@ class ProfileConfig:
     auto_retries: bool = True
     force_stream: bool = True
     model_fallback_enabled: bool = False
+    # Codex CLI is stricter than many OpenAI-compatible clients about
+    # Responses-API SSE item lifecycle events. Keep this off by default
+    # and enable it only for profiles that are actually used by Codex.
+    codex_compat_enabled: bool = False
 
     def has(self, feature: str) -> bool:
         if feature in self.disabled_features:
@@ -343,6 +347,27 @@ def _builtin_defaults() -> BridgeConfig:
                 model_fallback_enabled=False,
                 queue_priority=5,
             ),
+            "codex": ProfileConfig(
+                name="codex",
+                upstream="nan",
+                features={
+                    "model_sampling_defaults",
+                    "drop_oai_only_fields",
+                    "effort_to_thinking_budget",
+                    "thinking_overflow_recovery",
+                    "silent_completion_recovery",
+                    "truncated_content_recovery",
+                    "empty_with_stop_retry",
+                    "xml_tool_residue_retry",
+                    "tool_call_args_retry",
+                },
+                default_max_output_tokens=None,
+                auto_retries=True,
+                force_stream=True,
+                model_fallback_enabled=True,
+                codex_compat_enabled=True,
+                queue_priority=10,
+            ),
         },
         default_profile="default",
     )
@@ -363,7 +388,7 @@ _SAMPLE_CONFIG_YAML = """\
 #   profiles:  <name>: { upstream, features:[...], disabled_features:[...], queue_priority,
 #                        thinking_enabled, default_thinking_budget,
 #                        default_max_output_tokens, model_aliases:{...},
-#                        model_fallback_enabled }
+#                        model_fallback_enabled, codex-compat-enabled }
 #   default_profile: <name>      # which profile catches /v1/... (no prefix)
 #
 # Thinking policy:
@@ -394,6 +419,10 @@ _SAMPLE_CONFIG_YAML = """\
 #   10  interactive agents
 #    5  project-specific workers
 #    0  default / unknown clients
+#
+# `codex-compat-enabled`: false by default. Enable only for a Codex
+# profile to synthesize strict Responses-API SSE closing events Codex
+# waits for.
 
 upstreams:
   nan:
@@ -438,6 +467,26 @@ profiles:
       - empty_with_stop_retry
       - gemma_thought_leak_retry
     disabled_features: []
+
+  codex:
+    upstream: nan
+    queue_priority: 10
+    auto_retries: true
+    force_stream: true
+    model_fallback_enabled: true
+    # Codex-only Responses adapter. It rewrites Codex's request shape for
+    # NaN/LiteLLM and is not a transparent Responses proxy for other clients.
+    codex-compat-enabled: true
+    features:
+      - model_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+      - tool_call_args_retry
+      - xml_tool_residue_retry
 
 default_profile: default
 """
@@ -661,6 +710,9 @@ def _load_config() -> BridgeConfig:
             auto_retries=bool(body.get("auto_retries", True)),
             force_stream=bool(body.get("force_stream", True)),
             model_fallback_enabled=bool(body.get("model_fallback_enabled", False)),
+            codex_compat_enabled=bool(
+                body.get("codex_compat_enabled", body.get("codex-compat-enabled", False))
+            ),
         )
     if not profiles:
         profiles = _builtin_defaults().profiles
@@ -1409,6 +1461,33 @@ def _read_auth_key_from_env_file() -> str | None:
     return None
 
 
+def _redact_sensitive_text(text: str) -> str:
+    redacted = text
+    known_secrets = {
+        value
+        for value in (
+            os.environ.get("X_NAN_KEY"),
+            os.environ.get("NAN_API_KEY"),
+            os.environ.get("OPENAI_API_KEY"),
+            _read_auth_key_from_env_file(),
+        )
+        if isinstance(value, str) and len(value) >= 8
+    }
+    for secret in known_secrets:
+        redacted = redacted.replace(secret, "<redacted>")
+    redacted = re.sub(
+        r"(?i)(api[_-]?key[\"'\s:=]+)[A-Za-z0-9._-]{16,}",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(bearer\s+)[A-Za-z0-9._-]{16,}",
+        r"\1<redacted>",
+        redacted,
+    )
+    return redacted
+
+
 def _model_health_snapshot() -> dict[str, dict[str, dict[str, Any]]]:
     return {
         upstream: {model: dict(status) for model, status in models.items()}
@@ -1460,7 +1539,7 @@ def _mark_model_inactive(upstream: str, model: str | None, reason: str) -> None:
         "checked_at": time.time(),
         "latency_s": None,
         "status": None,
-        "error": reason[:200],
+        "error": _redact_sensitive_text(reason)[:200],
     }
 
 
@@ -1480,7 +1559,7 @@ def _preserve_model_health_status(
         "checked_at": time.time(),
         "latency_s": latency_s,
         "status": status,
-        "error": reason[:200],
+        "error": _redact_sensitive_text(reason)[:200],
         "stale": True,
     }
 
@@ -1585,7 +1664,9 @@ async def _probe_model_health(upstream: UpstreamConfig, model: str) -> dict[str,
             try:
                 if response.status_code >= 400:
                     body_bytes = await response.aread()
-                    error = body_bytes.decode("utf-8", errors="ignore")[:200]
+                    error = _redact_sensitive_text(
+                        body_bytes.decode("utf-8", errors="ignore")
+                    )[:200]
                     if response.status_code == 429:
                         return _preserve_model_health_status(
                             upstream.name,
@@ -2056,6 +2137,37 @@ def _content_to_string(content: Any) -> str:
     return str(content or "")
 
 
+def _normalize_codex_message_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _content_to_string(content)
+
+    normalized_parts: list[Any] = []
+    for part in content:
+        if isinstance(part, str):
+            normalized_parts.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            text = str(part or "")
+            if text:
+                normalized_parts.append({"type": "input_text", "text": text})
+            continue
+        normalized = dict(part)
+        if normalized.get("type") == "output_text":
+            normalized["type"] = "input_text"
+        normalized_parts.append(normalized)
+    return normalized_parts or ""
+
+
+def _normalize_codex_message_input_item(item: dict) -> dict:
+    return {
+        "type": "message",
+        "role": item.get("role"),
+        "content": _normalize_codex_message_content(item.get("content")),
+    }
+
+
 
 def _chat_template_kwargs_from_body(body: dict) -> dict:
     value = body.get("chat_template_kwargs")
@@ -2342,6 +2454,66 @@ def _drop_oai_only_fields(body: dict) -> None:
         body.pop(field_name, None)
 
 
+def _normalize_codex_responses_body(body: dict) -> None:
+    """Adapt Codex's full Responses payload to NaN/LiteLLM's stricter parser.
+
+    Codex sends top-level `instructions` plus `input` items with role
+    `developer`. LiteLLM eventually maps those developer items to system
+    messages, and some upstreams then reject the request because system
+    messages no longer appear as one single leading block. Fold them into
+    `instructions` so the prompt semantics stay intact.
+
+    Codex can also send OpenAI's namespace tool wrapper for MCP servers.
+    NaN/LiteLLM's Responses endpoint currently validates only concrete tool
+    types, so namespace wrappers make the whole request fail before the
+    model runs. Keep regular function/custom tools and drop namespace
+    wrappers from the upstream request.
+    """
+    input_value = body.get("input")
+    instruction_parts: list[str] = []
+    if isinstance(body.get("instructions"), str) and body["instructions"].strip():
+        instruction_parts.append(body["instructions"].strip())
+
+    if isinstance(input_value, list):
+        filtered_input: list[Any] = []
+        for item in input_value:
+            if not isinstance(item, dict) or item.get("type", "message") != "message":
+                filtered_input.append(item)
+                continue
+
+            role = item.get("role")
+            if role in {"developer", "system"}:
+                text = _content_to_string(item.get("content")).strip()
+                if text:
+                    instruction_parts.append(text)
+                continue
+            if role in {"user", "assistant"}:
+                filtered_input.append(_normalize_codex_message_input_item(item))
+                continue
+            filtered_input.append(item)
+        body["input"] = filtered_input
+
+    if instruction_parts:
+        body["instructions"] = "\n\n".join(instruction_parts)
+    else:
+        body.pop("instructions", None)
+
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+    normalized_tools = [
+        tool
+        for tool in tools
+        if not (isinstance(tool, dict) and tool.get("type") == "namespace")
+    ]
+    if normalized_tools:
+        body["tools"] = normalized_tools
+    else:
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        body.pop("parallel_tool_calls", None)
+
+
 
 def _apply_force_overrides(body: dict, profile: ProfileConfig, kind: str) -> None:
     if profile.force_max_output_tokens is not None:
@@ -2396,6 +2568,8 @@ def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> 
     _apply_force_overrides(body, profile, kind)
     if profile.has("drop_oai_only_fields"):
         _drop_oai_only_fields(body)
+    if kind == "responses" and profile.codex_compat_enabled:
+        _normalize_codex_responses_body(body)
     # Always last: cap max_tokens so prompt+cap fits the context window.
     # Runs after every other transform (which may have bumped or
     # rewritten max_tokens) so the clamp sees the final value.
@@ -2671,6 +2845,11 @@ def _is_responses_silent_completion(
     if response_obj.get("status") != "completed":
         return False
     if not message_emitted:
+        completed_text = _response_message_output_text(response_obj)
+        if completed_text.strip():
+            return _looks_like_fake_invocation(completed_text)
+        if _response_has_function_call_output(response_obj):
+            return False
         return True
     return _looks_like_fake_invocation(emitted_text)
 
@@ -2823,6 +3002,204 @@ def _sse(obj: dict) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _sse_done() -> bytes:
+    return b"data: [DONE]\n\n"
+
+
+_CODEX_FALLBACK_REASONING_SUMMARY = "Thinking before answering."
+_CODEX_STREAM_DELTA_MAX_CHARS = 80
+_CODEX_STREAM_DELTA_DELAY_S = 0.01
+
+
+def _split_codex_text_delta(delta: str) -> list[str]:
+    if len(delta) <= _CODEX_STREAM_DELTA_MAX_CHARS:
+        return [delta]
+    return [
+        delta[i : i + _CODEX_STREAM_DELTA_MAX_CHARS]
+        for i in range(0, len(delta), _CODEX_STREAM_DELTA_MAX_CHARS)
+    ]
+
+
+def _has_reasoning_summary_text(summary: Any) -> bool:
+    return any(
+        isinstance(part, dict) and bool(str(part.get("text") or "").strip())
+        for part in (summary or [])
+    )
+
+
+def _has_reasoning_payload(item: dict) -> bool:
+    if item.get("encrypted_content"):
+        return True
+    return any(
+        isinstance(part, dict) and bool(str(part.get("text") or "").strip())
+        for part in (item.get("content") or [])
+    )
+
+
+def _patch_codex_reasoning_summaries(response_obj: dict) -> tuple[dict, bool]:
+    """Give Codex a visible reasoning summary when upstream only returns raw CoT.
+
+    NaN/Gemma can return a Responses `reasoning` item with `content` but an
+    empty `summary`. Codex stores that item but the TUI has no safe summary to
+    render. We add a generic summary marker rather than copying the raw
+    reasoning text into UI-visible fields.
+    """
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return response_obj, False
+
+    changed = False
+    patched_output: list[Any] = []
+    for idx, item in enumerate(output):
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            patched_output.append(item)
+            continue
+        patched_item = item
+        if not patched_item.get("id"):
+            patched_item = dict(patched_item)
+            patched_item["id"] = f"rs_bridge_{idx}_{int(time.time() * 1000)}"
+            changed = True
+        if (
+            not _has_reasoning_summary_text(patched_item.get("summary"))
+            and _has_reasoning_payload(patched_item)
+        ):
+            if patched_item is item:
+                patched_item = dict(patched_item)
+            patched_item["summary"] = [
+                {
+                    "type": "summary_text",
+                    "text": _CODEX_FALLBACK_REASONING_SUMMARY,
+                }
+            ]
+            changed = True
+        if patched_item.get("content") is not None:
+            if patched_item is item:
+                patched_item = dict(patched_item)
+            # Do not forward raw chain-of-thought content to Codex. Codex can
+            # render safe summaries from the `summary` field.
+            patched_item["content"] = None
+            changed = True
+        patched_output.append(patched_item)
+
+    if not changed:
+        return response_obj, False
+    patched_response = dict(response_obj)
+    patched_response["output"] = patched_output
+    return patched_response, True
+
+
+def _coerce_codex_function_arguments(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    if arguments is None:
+        return ""
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except TypeError:
+        return str(arguments)
+
+
+def _codex_function_call_item(item: dict, output_index: int, status: str) -> dict:
+    patched = dict(item)
+    suffix = f"{output_index}_{int(time.time() * 1000)}"
+    if not isinstance(patched.get("id"), str) or not patched["id"]:
+        patched["id"] = f"fc_bridge_{suffix}"
+    if not isinstance(patched.get("call_id"), str) or not patched["call_id"]:
+        patched["call_id"] = f"call_bridge_{suffix}"
+    patched["arguments"] = _coerce_codex_function_arguments(patched.get("arguments"))
+    patched["status"] = status
+    return patched
+
+
+def _patch_codex_function_call_items(response_obj: dict) -> tuple[dict, bool]:
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return response_obj, False
+
+    changed = False
+    patched_output: list[Any] = []
+    for idx, item in enumerate(output):
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            patched_output.append(item)
+            continue
+        patched_item = _codex_function_call_item(item, idx, "completed")
+        if patched_item != item:
+            changed = True
+        patched_output.append(patched_item)
+
+    if not changed:
+        return response_obj, False
+    patched_response = dict(response_obj)
+    patched_response["output"] = patched_output
+    return patched_response, True
+
+
+def _reasoning_item_summary_text(item: dict) -> str:
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return ""
+    texts: list[str] = []
+    for part in summary:
+        if isinstance(part, dict) and part.get("type") == "summary_text":
+            text = part.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    return "".join(texts)
+
+
+def _codex_reasoning_item(item: dict, output_index: int, summary_text: str) -> dict:
+    patched = dict(item)
+    if not isinstance(patched.get("id"), str) or not patched["id"]:
+        patched["id"] = f"rs_bridge_{output_index}_{int(time.time() * 1000)}"
+    patched["type"] = "reasoning"
+    patched["summary"] = [{"type": "summary_text", "text": summary_text}]
+    patched["content"] = None
+    return patched
+
+
+def _message_item_output_text(item: dict) -> tuple[str, int]:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return "", 0
+
+    texts: list[str] = []
+    first_content_index = 0
+    found_text = False
+    for idx, part in enumerate(content):
+        if not isinstance(part, dict) or part.get("type") != "output_text":
+            continue
+        if not found_text:
+            first_content_index = idx
+            found_text = True
+        text = part.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return "".join(texts), first_content_index
+
+
+def _response_message_output_text(response_obj: dict) -> str:
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return ""
+    texts: list[str] = []
+    for item in output:
+        if isinstance(item, dict) and item.get("type") == "message":
+            text, _ = _message_item_output_text(item)
+            if text:
+                texts.append(text)
+    return "".join(texts)
+
+
+def _response_has_function_call_output(response_obj: dict) -> bool:
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "function_call"
+        for item in output
+    )
+
+
 def _coerce_error_payload(status: int, body_text: str) -> dict:
     """Parse the upstream's error text into an OpenAI-shaped envelope
     (`{error: {message, type, code}}`) so downstream clients can
@@ -2931,7 +3308,16 @@ async def _stream_responses(
     # happy never receives an `agent_message`, which manifests as
     # "session spawned but no response ever shows".
     open_messages: dict[int, dict] = {}
+    seen_output_item_indexes: set[int] = set()
+    done_output_item_indexes: set[int] = set()
+    message_done_output_indexes: set[int] = set()
+    message_done_item_ids: set[str] = set()
+    function_args_done_indexes: set[int] = set()
+    orphan_delta_message_indexes: set[int] = set()
+    provisional_message_indexes: set[int] = set()
+    ignored_provisional_message_indexes: set[int] = set()
     last_seq = 0
+    codex_compat_enabled = profile.codex_compat_enabled
 
     async def _open_stream():
         # tenacity on the entire stream open is fine — we don't replay
@@ -3052,17 +3438,24 @@ async def _stream_responses(
             while b"\n\n" in buffer:
                 event, buffer = buffer.split(b"\n\n", 1)
                 payload: dict | None = None
+                upstream_done = False
                 for line in event.splitlines():
                     if not line.startswith(b"data: "):
                         continue
+                    raw = line[6:].strip()
+                    if raw == b"[DONE]":
+                        upstream_done = True
+                        break
                     try:
-                        parsed = json.loads(line[6:])
+                        parsed = json.loads(raw)
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if isinstance(parsed, dict):
                         payload = parsed
                         break
                 if payload is None:
+                    if codex_compat_enabled and upstream_done:
+                        continue
                     yield event + b"\n\n"
                     continue
 
@@ -3082,11 +3475,45 @@ async def _stream_responses(
                 if isinstance(payload.get("sequence_number"), int):
                     last_seq = max(last_seq, payload["sequence_number"])
 
-                if etype == "response.output_item.added":
+                if codex_compat_enabled and etype == "response.output_item.added":
                     item = payload.get("item") or {}
+                    idx = payload.get("output_index")
                     if item.get("type") == "message":
-                        idx = payload.get("output_index")
                         if isinstance(idx, int):
+                            active_real_message = any(
+                                not st.get("synthetic_from_delta")
+                                and not st.get("provisional_from_unsequenced")
+                                for st in open_messages.values()
+                            )
+                            if message_done_output_indexes or active_real_message:
+                                ignored_provisional_message_indexes.add(idx)
+                                continue
+                            if "sequence_number" not in payload:
+                                open_messages[idx] = {
+                                    "id": item.get("id") or f"msg_{idx}_{int(time.time()*1000)}",
+                                    "role": item.get("role") or "assistant",
+                                    "text": "",
+                                    "content_index": 0,
+                                    "model": payload.get("model"),
+                                    "content_part_added": False,
+                                    "output_text_done": False,
+                                    "content_part_done": False,
+                                    "synthetic_from_delta": False,
+                                    "provisional_from_unsequenced": True,
+                                }
+                                provisional_message_indexes.add(idx)
+                                continue
+                            for orphan_idx in list(
+                                orphan_delta_message_indexes | provisional_message_indexes
+                            ):
+                                if orphan_idx != idx:
+                                    orphan_delta_message_indexes.discard(orphan_idx)
+                                    provisional_message_indexes.discard(orphan_idx)
+                                    ignored_provisional_message_indexes.add(orphan_idx)
+                                    open_messages.pop(orphan_idx, None)
+                            orphan_delta_message_indexes.discard(idx)
+                            provisional_message_indexes.discard(idx)
+                            seen_output_item_indexes.add(idx)
                             open_messages[idx] = {
                                 "id": item.get("id") or f"msg_{idx}_{int(time.time()*1000)}",
                                 "role": item.get("role") or "assistant",
@@ -3096,41 +3523,141 @@ async def _stream_responses(
                                 "content_part_added": False,
                                 "output_text_done": False,
                                 "content_part_done": False,
+                                "synthetic_from_delta": False,
+                                "provisional_from_unsequenced": False,
                             }
-                if etype == "response.content_part.added":
+                    elif isinstance(idx, int):
+                        seen_output_item_indexes.add(idx)
+                if codex_compat_enabled and etype == "response.content_part.added":
                     idx = payload.get("output_index")
+                    if isinstance(idx, int) and idx in ignored_provisional_message_indexes:
+                        continue
                     if isinstance(idx, int) and idx in open_messages:
                         open_messages[idx]["content_part_added"] = True
                         ci = payload.get("content_index")
                         if isinstance(ci, int):
                             open_messages[idx]["content_index"] = ci
+                        if idx in provisional_message_indexes:
+                            continue
                 if etype == "response.output_text.delta":
                     delta = payload.get("delta")
                     if isinstance(delta, str) and delta:
+                        idx = payload.get("output_index")
+                        if codex_compat_enabled and not isinstance(idx, int):
+                            idx = 0
+                        if codex_compat_enabled:
+                            if isinstance(idx, int) and idx in ignored_provisional_message_indexes:
+                                continue
+                            if idx not in open_messages:
+                                active_real_message = any(
+                                    not st.get("synthetic_from_delta")
+                                    for st in open_messages.values()
+                                )
+                                if active_real_message or message_done_output_indexes:
+                                    if isinstance(idx, int):
+                                        ignored_provisional_message_indexes.add(idx)
+                                    continue
+                                item_id = payload.get("item_id")
+                                if not isinstance(item_id, str) or not item_id:
+                                    item_id = f"msg_{idx}_{int(time.time()*1000)}"
+                                ci = payload.get("content_index")
+                                if not isinstance(ci, int):
+                                    ci = 0
+                                open_messages[idx] = {
+                                    "id": item_id,
+                                    "role": "assistant",
+                                    "text": "",
+                                    "content_index": ci,
+                                    "model": payload.get("model"),
+                                    "content_part_added": False,
+                                    "output_text_done": False,
+                                    "content_part_done": False,
+                                    "synthetic_from_delta": True,
+                                    "provisional_from_unsequenced": False,
+                                }
+                                orphan_delta_message_indexes.add(idx)
                         message_emitted = True
                         message_text_accum += delta
-                        idx = payload.get("output_index")
-                        if isinstance(idx, int) and idx in open_messages:
-                            open_messages[idx]["text"] += delta
-                if etype == "response.output_text.done":
+                        if codex_compat_enabled:
+                            if isinstance(idx, int) and idx in open_messages:
+                                open_messages[idx]["text"] += delta
+                            if isinstance(idx, int) and (
+                                idx in orphan_delta_message_indexes
+                                or idx in provisional_message_indexes
+                            ):
+                                continue
+                if codex_compat_enabled and etype == "response.output_text.done":
                     idx = payload.get("output_index")
                     if isinstance(idx, int) and idx in open_messages:
-                        open_messages[idx]["output_text_done"] = True
-                if etype == "response.content_part.done":
+                        text = payload.get("text")
+                        if isinstance(text, str) and not open_messages[idx]["text"]:
+                            open_messages[idx]["text"] = text
+                    # Codex materializes assistant messages from both
+                    # output_text.done and output_item.done. Keep only the
+                    # item-level close to avoid duplicate visible messages.
+                    continue
+                if codex_compat_enabled and etype == "response.content_part.done":
+                    continue
+                if codex_compat_enabled and etype == "response.function_call_arguments.done":
                     idx = payload.get("output_index")
-                    if isinstance(idx, int) and idx in open_messages:
-                        open_messages[idx]["content_part_done"] = True
-                if etype == "response.output_item.done":
+                    if isinstance(idx, int):
+                        function_args_done_indexes.add(idx)
+                if codex_compat_enabled and etype == "response.output_item.done":
                     idx = payload.get("output_index")
-                    if isinstance(idx, int) and idx in open_messages:
-                        # Upstream closed it properly — nothing to
-                        # synthesize for this index.
-                        open_messages.pop(idx, None)
+                    item = payload.get("item") or {}
+                    if isinstance(item, dict) and item.get("type") == "message":
+                        if isinstance(idx, int):
+                            if idx in ignored_provisional_message_indexes:
+                                open_messages.pop(idx, None)
+                                orphan_delta_message_indexes.discard(idx)
+                                provisional_message_indexes.discard(idx)
+                                continue
+                            text, content_index = _message_item_output_text(item)
+                            if text and idx in open_messages and not open_messages[idx].get("text"):
+                                open_messages[idx]["text"] = text
+                            if isinstance(content_index, int) and idx in open_messages:
+                                open_messages[idx]["content_index"] = content_index
+                            if (
+                                idx in orphan_delta_message_indexes
+                                or idx in provisional_message_indexes
+                                or (
+                                    message_done_output_indexes
+                                    and idx not in message_done_output_indexes
+                                )
+                            ):
+                                open_messages.pop(idx, None)
+                                orphan_delta_message_indexes.discard(idx)
+                                provisional_message_indexes.discard(idx)
+                                ignored_provisional_message_indexes.add(idx)
+                                continue
+                            done_output_item_indexes.add(idx)
+                            message_done_output_indexes.add(idx)
+                            item_id = item.get("id")
+                            if isinstance(item_id, str) and item_id:
+                                message_done_item_ids.add(item_id)
+                            open_messages.pop(idx, None)
+                    elif isinstance(idx, int):
+                        done_output_item_indexes.add(idx)
 
                 if etype == "response.completed":
                     # Buffer for potential post-stream recovery.
                     completed_payload = payload
                     continue
+
+                if (
+                    codex_compat_enabled
+                    and etype == "response.output_text.delta"
+                    and isinstance(payload.get("delta"), str)
+                    and "sequence_number" not in payload
+                ):
+                    delta_parts = _split_codex_text_delta(payload["delta"])
+                    if len(delta_parts) > 1:
+                        for delta_part in delta_parts:
+                            split_payload = dict(payload)
+                            split_payload["delta"] = delta_part
+                            yield _sse(split_payload)
+                            await asyncio.sleep(_CODEX_STREAM_DELTA_DELAY_S)
+                        continue
 
                 yield _sse(payload)
     except httpx.ReadTimeout as exc:
@@ -3146,13 +3673,43 @@ async def _stream_responses(
                 await gate.release(slot_id)
 
     if completed_payload is None:
-        return
+        if not codex_compat_enabled:
+            return
+        completed_payload = {
+            "type": "response.completed",
+            "response": {
+                "id": f"resp_bridge_{int(time.time() * 1000)}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "model": model_hint,
+                "output": [],
+            },
+            "sequence_number": last_seq + 1,
+            "model": model_hint,
+        }
 
     response_obj = completed_payload.get("response") or {}
+    if codex_compat_enabled and isinstance(response_obj, dict):
+        patched_response_obj, patched_reasoning_summary = (
+            _patch_codex_reasoning_summaries(response_obj)
+        )
+        if patched_reasoning_summary:
+            completed_payload = dict(completed_payload)
+            completed_payload["response"] = patched_response_obj
+            response_obj = patched_response_obj
+        patched_response_obj, patched_function_calls = (
+            _patch_codex_function_call_items(response_obj)
+        )
+        if patched_function_calls:
+            completed_payload = dict(completed_payload)
+            completed_payload["response"] = patched_response_obj
+            response_obj = patched_response_obj
 
-    # Diagnostic trace — useful for debugging silent/empty responses.
-    # Logged for default responses-API completions. Cheap and easy to grep.
-    if profile.name == "default":
+    # Diagnostic trace — useful for debugging silent/empty Codex responses.
+    # Cheap and easy to grep, but opt-in with the Codex compatibility mode
+    # so other profiles do not get noisy response traces.
+    if codex_compat_enabled:
         items = response_obj.get("output") or []
         item_summary = []
         for it in items:
@@ -3319,73 +3876,368 @@ async def _stream_responses(
             _broadcast_usage(record)
         state["response"] = _redact_response(fixed_completed)
         yield _sse(fixed_completed)
+        if codex_compat_enabled:
+            yield _sse_done()
         return
 
-    # NaN's /v1/responses stream sometimes omits the closing events for
-    # message items (output_text.done, content_part.done,
-    # output_item.done) — Codex CLI then never fires its own
-    # `item/completed`, so happy never receives an `agent_message`
-    # event. Synthesize the missing events here so the answer is
-    # actually delivered to the client.
     seq = last_seq
-    for idx, st in list(open_messages.items()):
-        if not st["text"]:
-            # The item was opened but never produced text — likely a
-            # tool_call wrapper, leave it alone.
-            continue
-        if not st["output_text_done"]:
+    codex_reasoning_done_indexes: set[int] = set()
+
+    if codex_compat_enabled and isinstance(response_obj, dict):
+        output = response_obj.get("output") or []
+        for idx, item in enumerate(output if isinstance(output, list) else []):
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "reasoning"
+                or idx in done_output_item_indexes
+            ):
+                continue
+            summary_text = _reasoning_item_summary_text(item).strip()
+            if not summary_text:
+                continue
+            done_item = _codex_reasoning_item(item, idx, summary_text)
+            added_item = dict(done_item)
+            added_item["summary"] = []
+            model_field = response_obj.get("model") or completed_payload.get("model")
+            item_id = done_item["id"]
+            if idx not in seen_output_item_indexes:
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": idx,
+                        "item": added_item,
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+                seen_output_item_indexes.add(idx)
             seq += 1
             yield _sse(
                 {
-                    "type": "response.output_text.done",
-                    "item_id": st["id"],
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": item_id,
                     "output_index": idx,
-                    "content_index": st["content_index"],
-                    "text": st["text"],
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
                     "sequence_number": seq,
-                    "model": st["model"],
+                    "model": model_field,
                 }
             )
-        if not st["content_part_done"]:
+            for delta_part in _split_codex_text_delta(summary_text):
+                if not delta_part:
+                    continue
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": item_id,
+                        "output_index": idx,
+                        "summary_index": 0,
+                        "delta": delta_part,
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
             seq += 1
             yield _sse(
                 {
-                    "type": "response.content_part.done",
-                    "item_id": st["id"],
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": item_id,
                     "output_index": idx,
-                    "content_index": st["content_index"],
-                    "part": {
-                        "type": "output_text",
-                        "text": st["text"],
-                        "annotations": [],
+                    "summary_index": 0,
+                    "text": summary_text,
+                    "sequence_number": seq,
+                    "model": model_field,
+                }
+            )
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": item_id,
+                    "output_index": idx,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": summary_text},
+                    "sequence_number": seq,
+                    "model": model_field,
+                }
+            )
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": done_item,
+                    "sequence_number": seq,
+                    "model": model_field,
+                }
+            )
+            done_output_item_indexes.add(idx)
+            codex_reasoning_done_indexes.add(idx)
+
+    # NaN can return function calls only in the terminal response.completed
+    # payload. Codex relies on the streamed function-call lifecycle to execute
+    # the tool and send the next turn, so fill the missing events before the
+    # terminal completed event.
+    if codex_compat_enabled and isinstance(response_obj, dict):
+        output = response_obj.get("output") or []
+        for idx, item in enumerate(output if isinstance(output, list) else []):
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "function_call"
+                or idx in done_output_item_indexes
+            ):
+                continue
+            done_item = _codex_function_call_item(item, idx, "completed")
+            added_item = _codex_function_call_item(item, idx, "in_progress")
+            added_item["arguments"] = ""
+            model_field = response_obj.get("model") or completed_payload.get("model")
+            item_id = done_item["id"]
+            arguments = done_item.get("arguments") or ""
+            name = done_item.get("name") or ""
+            if idx not in seen_output_item_indexes:
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": idx,
+                        "item": added_item,
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+                seen_output_item_indexes.add(idx)
+            if idx not in function_args_done_indexes:
+                if arguments:
+                    seq += 1
+                    yield _sse(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "delta": arguments,
+                            "sequence_number": seq,
+                            "model": model_field,
+                        }
+                    )
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": idx,
+                        "arguments": arguments,
+                        "name": name,
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+                function_args_done_indexes.add(idx)
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": done_item,
+                    "sequence_number": seq,
+                    "model": model_field,
+                }
+            )
+            done_output_item_indexes.add(idx)
+
+    if codex_compat_enabled and isinstance(response_obj, dict):
+        output = response_obj.get("output") or []
+        for idx, item in enumerate(output if isinstance(output, list) else []):
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "message"
+                or idx in done_output_item_indexes
+                or item.get("id") in message_done_item_ids
+            ):
+                continue
+            completed_text, completed_content_index = _message_item_output_text(item)
+            if not completed_text:
+                continue
+            event_idx = idx
+            st_source_idx = idx
+            st = open_messages.get(idx) or {}
+            item_id = item.get("id")
+            if not st and isinstance(item_id, str) and item_id:
+                for candidate_idx, candidate in open_messages.items():
+                    if candidate.get("id") == item_id:
+                        event_idx = candidate_idx
+                        st_source_idx = candidate_idx
+                        st = candidate
+                        break
+            if st and event_idx in codex_reasoning_done_indexes and idx != event_idx:
+                event_idx = idx
+            model_field = (
+                st.get("model")
+                or response_obj.get("model")
+                or completed_payload.get("model")
+            )
+            item_id = item_id or st.get("id") or f"msg_bridge_{event_idx}_{int(time.time() * 1000)}"
+            role = item.get("role") or st.get("role") or "assistant"
+            content_index = st.get("content_index")
+            if not isinstance(content_index, int):
+                content_index = completed_content_index
+            if event_idx not in seen_output_item_indexes:
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": event_idx,
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "role": role,
+                            "content": [],
+                            "status": "in_progress",
+                        },
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+                seen_output_item_indexes.add(event_idx)
+            if not st.get("content_part_added"):
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": event_idx,
+                        "content_index": content_index,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+            streamed_text = st.get("text") if isinstance(st.get("text"), str) else ""
+            if st.get("synthetic_from_delta") and event_idx not in done_output_item_indexes:
+                streamed_text = ""
+            delta_text = ""
+            if not streamed_text:
+                delta_text = completed_text
+            elif completed_text.startswith(streamed_text):
+                delta_text = completed_text[len(streamed_text):]
+            for delta_part in _split_codex_text_delta(delta_text):
+                if not delta_part:
+                    continue
+                seq += 1
+                yield _sse(
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": event_idx,
+                        "content_index": content_index,
+                        "delta": delta_part,
+                        "sequence_number": seq,
+                        "model": model_field,
+                    }
+                )
+            done_item = dict(item)
+            done_item["id"] = item_id
+            done_item["role"] = role
+            done_item["status"] = "completed"
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": event_idx,
+                    "item": done_item,
+                    "sequence_number": seq,
+                    "model": model_field,
+                }
+            )
+            done_output_item_indexes.add(event_idx)
+            done_output_item_indexes.add(idx)
+            message_done_output_indexes.add(event_idx)
+            message_done_output_indexes.add(idx)
+            if isinstance(item_id, str) and item_id:
+                message_done_item_ids.add(item_id)
+            open_messages.pop(event_idx, None)
+            if st_source_idx != event_idx:
+                open_messages.pop(st_source_idx, None)
+
+        for idx, st in list(open_messages.items()):
+            if (
+                idx in ignored_provisional_message_indexes
+                or idx in orphan_delta_message_indexes
+                or idx in provisional_message_indexes
+            ):
+                open_messages.pop(idx, None)
+                continue
+            text = st.get("text")
+            if not isinstance(text, str) or not text:
+                open_messages.pop(idx, None)
+                continue
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": {
+                        "id": st["id"],
+                        "type": "message",
+                        "role": st["role"],
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": text,
+                                "annotations": [],
+                            }
+                        ],
                     },
                     "sequence_number": seq,
                     "model": st["model"],
                 }
             )
-        seq += 1
-        yield _sse(
-            {
-                "type": "response.output_item.done",
-                "output_index": idx,
-                "item": {
-                    "id": st["id"],
-                    "type": "message",
-                    "role": st["role"],
-                    "status": "completed",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": st["text"],
-                            "annotations": [],
-                        }
-                    ],
-                },
-                "sequence_number": seq,
-                "model": st["model"],
-            }
-        )
-        open_messages.pop(idx, None)
+            done_output_item_indexes.add(idx)
+            message_done_output_indexes.add(idx)
+            item_id = st.get("id")
+            if isinstance(item_id, str) and item_id:
+                message_done_item_ids.add(item_id)
+            open_messages.pop(idx, None)
+
+        if (
+            message_done_output_indexes
+            or message_done_item_ids
+            or codex_reasoning_done_indexes
+        ):
+            output = response_obj.get("output") or []
+            if isinstance(output, list):
+                stripped_output = [
+                    item
+                    for idx, item in enumerate(output)
+                    if not (
+                        isinstance(item, dict)
+                        and (
+                            (
+                                item.get("type") == "message"
+                                and (
+                                    idx in message_done_output_indexes
+                                    or item.get("id") in message_done_item_ids
+                                )
+                            )
+                            or (
+                                item.get("type") == "reasoning"
+                                and idx in codex_reasoning_done_indexes
+                            )
+                        )
+                    )
+                ]
+                if len(stripped_output) != len(output):
+                    response_obj = dict(response_obj)
+                    response_obj["output"] = stripped_output
+                    completed_payload = dict(completed_payload)
+                    completed_payload["response"] = response_obj
+
     if seq != last_seq:
         # We synthesized events — bump the sequence_number on the
         # buffered completed payload so it doesn't go backwards.
@@ -3398,6 +4250,8 @@ async def _stream_responses(
         _broadcast_usage(record)
     state["response"] = _redact_response(completed_payload)
     yield _sse(completed_payload)
+    if codex_compat_enabled:
+        yield _sse_done()
 
 
 # =============================================================================
@@ -4738,7 +5592,12 @@ async def stats(
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
         "model_health": _model_health_snapshot(),
         "profiles": [
-            {"name": p.name, "upstream": p.upstream, "features": sorted(p.effective_features())}
+            {
+                "name": p.name,
+                "upstream": p.upstream,
+                "features": sorted(p.effective_features()),
+                "codex_compat_enabled": p.codex_compat_enabled,
+            }
             for p in CONFIG.profiles.values()
         ],
         "history": {
@@ -4888,6 +5747,8 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
         entry["auto_retries"] = p.auto_retries
         entry["force_stream"] = p.force_stream
         entry["model_fallback_enabled"] = p.model_fallback_enabled
+        if p.codex_compat_enabled:
+            entry["codex-compat-enabled"] = True
         if p.force_model:
             entry["force_model"] = p.force_model
         if p.model_aliases:
@@ -5014,6 +5875,9 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
     if thinking_enabled is not True:
         default_effort = ""
         budget = None
+    codex_compat_enabled = bool(
+        body.get("codex_compat_enabled", body.get("codex-compat-enabled", False))
+    )
     return (
         ProfileConfig(
             name=name,
@@ -5034,6 +5898,7 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
             auto_retries=bool(body.get("auto_retries", True)),
             force_stream=bool(body.get("force_stream", True)),
             model_fallback_enabled=bool(body.get("model_fallback_enabled", False)),
+            codex_compat_enabled=codex_compat_enabled,
         ),
         None,
     )
@@ -5076,6 +5941,7 @@ async def config_get() -> dict:
                 "auto_retries": p.auto_retries,
                 "force_stream": p.force_stream,
                 "model_fallback_enabled": p.model_fallback_enabled,
+                "codex_compat_enabled": p.codex_compat_enabled,
                 "force_model": p.force_model,
                 "model_aliases": dict(p.model_aliases),
             }
@@ -7158,6 +8024,7 @@ def _dashboard_html() -> str:
         auto_retries: p.auto_retries !== false,
         force_stream: p.force_stream !== false,
         model_fallback_enabled: p.model_fallback_enabled === true,
+        codex_compat_enabled: p.codex_compat_enabled === true,
         force_model: p.force_model || '',
         features: new Set(p.features || []),
         aliases: aliasesToList(p.model_aliases),
@@ -7226,6 +8093,7 @@ def _dashboard_html() -> str:
         auto_retries: prof.auto_retries,
         force_stream: prof.force_stream,
         model_fallback_enabled: prof.model_fallback_enabled,
+        codex_compat_enabled: prof.codex_compat_enabled,
         force_model: prof.force_model || null,
         model_aliases: aliasesToMap(prof.aliases),
       }});
@@ -7329,6 +8197,7 @@ def _dashboard_html() -> str:
                 `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="auto_retries" ${{prof.auto_retries ? 'checked' : ''}}><strong>auto retries</strong><p>Retry transient upstream failures such as 524 before bytes reach the client.</p></label>` +
                 `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="force_stream" ${{prof.force_stream ? 'checked' : ''}}><strong>force stream</strong><p>Send stream=true upstream, including buffered bridge recovery retries.</p></label>` +
                 `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="model_fallback_enabled" ${{prof.model_fallback_enabled ? 'checked' : ''}}><strong>model fallback</strong><p>Fallback to another active model when the selected model is unhealthy or fails before bytes reach the client.</p></label>` +
+                `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="codex_compat_enabled" ${{prof.codex_compat_enabled ? 'checked' : ''}}><strong>codex mode</strong><p>Codex-only Responses adapter: rewrites requests for NaN/LiteLLM and emits strict closing SSE events.</p></label>` +
               `</div>` +
             `</div>` +
             `<div>` +
@@ -7380,7 +8249,7 @@ def _dashboard_html() -> str:
             }}
           }} else if (key === 'default_thinking_effort') {{
             prof[key] = t.value || '';
-          }} else if (key === 'auto_retries' || key === 'force_stream' || key === 'model_fallback_enabled') {{
+          }} else if (key === 'auto_retries' || key === 'force_stream' || key === 'model_fallback_enabled' || key === 'codex_compat_enabled') {{
             prof[key] = !!t.checked;
           }} else {{
             prof[key] = t.value;
@@ -7469,6 +8338,7 @@ def _dashboard_html() -> str:
         auto_retries: prof.auto_retries,
         force_stream: prof.force_stream,
         model_fallback_enabled: prof.model_fallback_enabled,
+        codex_compat_enabled: prof.codex_compat_enabled,
       }};
       try {{
         const r = await fetch('/config/profiles/' + encodeURIComponent(trimmedName), {{
@@ -7526,6 +8396,7 @@ def _dashboard_html() -> str:
         auto_retries: true,
         force_stream: true,
         model_fallback_enabled: false,
+        codex_compat_enabled: false,
         force_model: '',
         features: new Set(['model_sampling_defaults', 'effort_to_thinking_budget',
           'thinking_overflow_recovery', 'silent_completion_recovery',

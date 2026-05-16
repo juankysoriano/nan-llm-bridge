@@ -45,4 +45,24 @@ profiles:
       - gemma_thought_leak_retry
     disabled_features: []
 
+  codex:
+    upstream: nan
+    queue_priority: 10
+    auto_retries: true
+    force_stream: true
+    model_fallback_enabled: true
+    # Codex-only Responses adapter. It rewrites Codex's request shape for
+    # NaN/LiteLLM and is not a transparent Responses proxy for other clients.
+    codex-compat-enabled: true
+    features:
+      - model_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+      - tool_call_args_retry
+      - xml_tool_residue_retry
+
 default_profile: default
